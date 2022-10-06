@@ -21,6 +21,25 @@ pub fn to_vec(hex: &str) -> Option<Vec<u8>> {
 	Some(out)
 }
 
+pub fn to_slice(hex: &str, arr: &mut [u8]) -> Result<(), ()> {
+	let mut b = 0;
+	for (idx, c) in hex.as_bytes().iter().enumerate() {
+		b <<= 4;
+		match *c {
+			b'A'..=b'F' => b |= c - b'A' + 10,
+			b'a'..=b'f' => b |= c - b'a' + 10,
+			b'0'..=b'9' => b |= c - b'0',
+			_ => return Err(()),
+		}
+		if (idx & 1) == 1 {
+			arr[idx / 2] = b;
+			b = 0;
+		}
+	}
+
+	Ok(())
+}
+
 #[inline]
 pub fn hex_str(value: &[u8]) -> String {
 	let mut res = String::with_capacity(64);

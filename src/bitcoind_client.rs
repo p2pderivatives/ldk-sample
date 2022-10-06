@@ -1,6 +1,5 @@
 use crate::convert::{BlockchainInfo, FeeResponse, FundedTx, NewAddress, RawTx, SignedTx};
 use base64;
-use bitcoin::blockdata::block::Block;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::consensus::encode;
 use bitcoin::hash_types::{BlockHash, Txid};
@@ -40,7 +39,9 @@ impl BlockSource for &BitcoindClient {
 		Box::pin(async move { self.bitcoind_rpc_client.get_header(header_hash, height_hint).await })
 	}
 
-	fn get_block<'a>(&'a self, header_hash: &'a BlockHash) -> AsyncBlockSourceResult<'a, Block> {
+	fn get_block<'a>(
+		&'a self, header_hash: &'a BlockHash,
+	) -> AsyncBlockSourceResult<'a, lightning_block_sync::BlockData> {
 		Box::pin(async move { self.bitcoind_rpc_client.get_block(header_hash).await })
 	}
 
