@@ -1,425 +1,306 @@
 use crate::disk;
 use crate::hex_utils;
 use crate::{
-	ChannelManager, HTLCStatus, InvoicePayer, MillisatAmount, NetworkGraph, NodeAlias, PaymentInfo,
+	ChannelManager, HTLCStatus, InvoicePayer, MillisatAmount, NetworkGraph, PaymentInfo,
 	PaymentInfoStorage, PeerManager,
 };
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
-use lightning::chain::keysinterface::{KeysInterface, KeysManager, Recipient};
-use lightning::ln::msgs::NetAddress;
+use dlc_manager::custom_signer::CustomKeysManager;
+use lightning::chain::keysinterface::{KeysInterface, Recipient};
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::NodeId;
-use lightning::util::config::{ChannelConfig, ChannelHandshakeLimits, UserConfig};
+use lightning::util::config::ChannelHandshakeConfig;
+use lightning::util::config::{ChannelHandshakeLimits, UserConfig};
 use lightning::util::events::EventHandler;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
-use std::env;
 use std::io;
 use std::io::{BufRead, Write};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub(crate) struct LdkUserInfo {
-	pub(crate) bitcoind_rpc_username: String,
-	pub(crate) bitcoind_rpc_password: String,
-	pub(crate) bitcoind_rpc_port: u16,
-	pub(crate) bitcoind_rpc_host: String,
-	pub(crate) ldk_storage_dir_path: String,
-	pub(crate) ldk_peer_listening_port: u16,
-	pub(crate) ldk_announced_listen_addr: Vec<NetAddress>,
-	pub(crate) ldk_announced_node_name: [u8; 32],
-	pub(crate) network: Network,
-}
-
-pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
-	if env::args().len() < 3 {
-		println!("ldk-tutorial-node requires 3 arguments: `cargo run <bitcoind-rpc-username>:<bitcoind-rpc-password>@<bitcoind-rpc-host>:<bitcoind-rpc-port> ldk_storage_directory_path [<ldk-incoming-peer-listening-port>] [bitcoin-network] [announced-node-name announced-listen-addr*]`");
-		return Err(());
-	}
-	let bitcoind_rpc_info = env::args().skip(1).next().unwrap();
-	let bitcoind_rpc_info_parts: Vec<&str> = bitcoind_rpc_info.rsplitn(2, "@").collect();
-	if bitcoind_rpc_info_parts.len() != 2 {
-		println!("ERROR: bad bitcoind RPC URL provided");
-		return Err(());
-	}
-	let rpc_user_and_password: Vec<&str> = bitcoind_rpc_info_parts[1].split(":").collect();
-	if rpc_user_and_password.len() != 2 {
-		println!("ERROR: bad bitcoind RPC username/password combo provided");
-		return Err(());
-	}
-	let bitcoind_rpc_username = rpc_user_and_password[0].to_string();
-	let bitcoind_rpc_password = rpc_user_and_password[1].to_string();
-	let bitcoind_rpc_path: Vec<&str> = bitcoind_rpc_info_parts[0].split(":").collect();
-	if bitcoind_rpc_path.len() != 2 {
-		println!("ERROR: bad bitcoind RPC path provided");
-		return Err(());
-	}
-	let bitcoind_rpc_host = bitcoind_rpc_path[0].to_string();
-	let bitcoind_rpc_port = bitcoind_rpc_path[1].parse::<u16>().unwrap();
-
-	let ldk_storage_dir_path = env::args().skip(2).next().unwrap();
-
-	let mut ldk_peer_port_set = true;
-	let ldk_peer_listening_port: u16 = match env::args().skip(3).next().map(|p| p.parse()) {
-		Some(Ok(p)) => p,
-		Some(Err(_)) => {
-			ldk_peer_port_set = false;
-			9735
-		}
-		None => {
-			ldk_peer_port_set = false;
-			9735
-		}
-	};
-
-	let mut arg_idx = match ldk_peer_port_set {
-		true => 4,
-		false => 3,
-	};
-	let network: Network = match env::args().skip(arg_idx).next().as_ref().map(String::as_str) {
-		Some("testnet") => Network::Testnet,
-		Some("regtest") => Network::Regtest,
-		Some("signet") => Network::Signet,
-		Some(net) => {
-			panic!("Unsupported network provided. Options are: `regtest`, `testnet`, and `signet`. Got {}", net);
-		}
-		None => Network::Testnet,
-	};
-
-	let ldk_announced_node_name = match env::args().skip(arg_idx + 1).next().as_ref() {
-		Some(s) => {
-			if s.len() > 32 {
-				panic!("Node Alias can not be longer than 32 bytes");
-			}
-			arg_idx += 1;
-			let mut bytes = [0; 32];
-			bytes[..s.len()].copy_from_slice(s.as_bytes());
-			bytes
-		}
-		None => [0; 32],
-	};
-
-	let mut ldk_announced_listen_addr = Vec::new();
-	loop {
-		match env::args().skip(arg_idx + 1).next().as_ref() {
-			Some(s) => match IpAddr::from_str(s) {
-				Ok(IpAddr::V4(a)) => {
-					ldk_announced_listen_addr
-						.push(NetAddress::IPv4 { addr: a.octets(), port: ldk_peer_listening_port });
-					arg_idx += 1;
-				}
-				Ok(IpAddr::V6(a)) => {
-					ldk_announced_listen_addr
-						.push(NetAddress::IPv6 { addr: a.octets(), port: ldk_peer_listening_port });
-					arg_idx += 1;
-				}
-				Err(_) => panic!("Failed to parse announced-listen-addr into an IP address"),
-			},
-			None => break,
-		}
-	}
-
-	Ok(LdkUserInfo {
-		bitcoind_rpc_username,
-		bitcoind_rpc_password,
-		bitcoind_rpc_host,
-		bitcoind_rpc_port,
-		ldk_storage_dir_path,
-		ldk_peer_listening_port,
-		ldk_announced_listen_addr,
-		ldk_announced_node_name,
-		network,
-	})
-}
-
 pub(crate) async fn poll_for_user_input<E: EventHandler>(
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
-	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
+	channel_manager: Arc<ChannelManager>, keys_manager: Arc<CustomKeysManager>,
 	network_graph: Arc<NetworkGraph>, inbound_payments: PaymentInfoStorage,
 	outbound_payments: PaymentInfoStorage, ldk_data_dir: String, network: Network,
+	logger: Arc<disk::FilesystemLogger>,
 ) {
-	println!("LDK startup successful. To view available commands: \"help\".");
-	println!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
-	println!("Local Node ID is {}.", channel_manager.get_our_node_id());
+	println!("To view available commands: \"help\".");
 	let stdin = io::stdin();
 	let mut line_reader = stdin.lock().lines();
-	loop {
-		print!("> ");
-		io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
-		let line = match line_reader.next() {
-			Some(l) => l.unwrap(),
-			None => break,
-		};
-		let mut words = line.split_whitespace();
-		if let Some(word) = words.next() {
-			match word {
-				"help" => help(),
-				"openchannel" => {
-					let peer_pubkey_and_ip_addr = words.next();
-					let channel_value_sat = words.next();
-					if peer_pubkey_and_ip_addr.is_none() || channel_value_sat.is_none() {
-						println!("ERROR: openchannel has 2 required arguments: `openchannel pubkey@host:port channel_amt_satoshis` [--public]");
-						continue;
-					}
-					let peer_pubkey_and_ip_addr = peer_pubkey_and_ip_addr.unwrap();
-					let (pubkey, peer_addr) =
-						match parse_peer_info(peer_pubkey_and_ip_addr.to_string()) {
-							Ok(info) => info,
-							Err(e) => {
-								println!("{:?}", e.into_inner().unwrap());
-								continue;
-							}
-						};
-
-					let chan_amt_sat: Result<u64, _> = channel_value_sat.unwrap().parse();
-					if chan_amt_sat.is_err() {
-						println!("ERROR: channel amount must be a number");
-						continue;
-					}
-
-					if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
-						.await
-						.is_err()
-					{
-						continue;
-					};
-
-					let announce_channel = match words.next() {
-						Some("--public") | Some("--public=true") => true,
-						Some("--public=false") => false,
-						Some(_) => {
-							println!("ERROR: invalid `--public` command format. Valid formats: `--public`, `--public=true` `--public=false`");
-							continue;
-						}
-						None => false,
-					};
-
-					if open_channel(
-						pubkey,
-						chan_amt_sat.unwrap(),
-						announce_channel,
-						channel_manager.clone(),
-					)
-					.is_ok()
-					{
-						let peer_data_path = format!("{}/channel_peer_data", ldk_data_dir.clone());
-						let _ = disk::persist_channel_peer(
-							Path::new(&peer_data_path),
-							peer_pubkey_and_ip_addr,
-						);
-					}
+	print!("> ");
+	io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
+	let line = match line_reader.next() {
+		Some(l) => l.unwrap(),
+		None => return,
+	};
+	let mut words = line.split_whitespace();
+	if let Some(word) = words.next() {
+		match word {
+			"help" => help(),
+			"openchannel" => {
+				let peer_pubkey_and_ip_addr = words.next();
+				let channel_value_sat = words.next();
+				if peer_pubkey_and_ip_addr.is_none() || channel_value_sat.is_none() {
+					println!("ERROR: openchannel has 2 required arguments: `openchannel pubkey@host:port channel_amt_satoshis` [--public]");
+					return;
 				}
-				"sendpayment" => {
-					let invoice_str = words.next();
-					if invoice_str.is_none() {
-						println!("ERROR: sendpayment requires an invoice: `sendpayment <invoice>`");
-						continue;
+				let peer_pubkey_and_ip_addr = peer_pubkey_and_ip_addr.unwrap();
+				let (pubkey, peer_addr) = match parse_peer_info(peer_pubkey_and_ip_addr.to_string())
+				{
+					Ok(info) => info,
+					Err(e) => {
+						println!("{:?}", e.into_inner().unwrap());
+						return;
 					}
+				};
 
-					let invoice = match Invoice::from_str(invoice_str.unwrap()) {
-						Ok(inv) => inv,
-						Err(e) => {
-							println!("ERROR: invalid invoice: {:?}", e);
-							continue;
-						}
-					};
-
-					send_payment(&*invoice_payer, &invoice, outbound_payments.clone());
+				let chan_amt_sat: Result<u64, _> = channel_value_sat.unwrap().parse();
+				if chan_amt_sat.is_err() {
+					println!("ERROR: channel amount must be a number");
+					return;
 				}
-				"keysend" => {
-					let dest_pubkey = match words.next() {
-						Some(dest) => match hex_utils::to_compressed_pubkey(dest) {
-							Some(pk) => pk,
-							None => {
-								println!("ERROR: couldn't parse destination pubkey");
-								continue;
-							}
-						},
-						None => {
-							println!("ERROR: keysend requires a destination pubkey: `keysend <dest_pubkey> <amt_msat>`");
-							continue;
-						}
-					};
-					let amt_msat_str = match words.next() {
-						Some(amt) => amt,
-						None => {
-							println!("ERROR: keysend requires an amount in millisatoshis: `keysend <dest_pubkey> <amt_msat>`");
-							continue;
-						}
-					};
-					let amt_msat: u64 = match amt_msat_str.parse() {
-						Ok(amt) => amt,
-						Err(e) => {
-							println!("ERROR: couldn't parse amount_msat: {}", e);
-							continue;
-						}
-					};
-					keysend(
-						&*invoice_payer,
-						dest_pubkey,
-						amt_msat,
-						&*keys_manager,
-						outbound_payments.clone(),
+
+				if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone()).await.is_err()
+				{
+					return;
+				};
+
+				let announce_channel = match words.next() {
+					Some("--public") | Some("--public=true") => true,
+					Some("--public=false") => false,
+					Some(_) => {
+						println!("ERROR: invalid `--public` command format. Valid formats: `--public`, `--public=true` `--public=false`");
+						return;
+					}
+					None => false,
+				};
+
+				if open_channel(
+					pubkey,
+					chan_amt_sat.unwrap(),
+					announce_channel,
+					channel_manager.clone(),
+				)
+				.is_ok()
+				{
+					let peer_data_path = format!("{}/channel_peer_data", ldk_data_dir.clone());
+					let _ = disk::persist_channel_peer(
+						Path::new(&peer_data_path),
+						peer_pubkey_and_ip_addr,
 					);
 				}
-				"getinvoice" => {
-					let amt_str = words.next();
-					if amt_str.is_none() {
-						println!("ERROR: getinvoice requires an amount in millisatoshis");
-						continue;
-					}
-
-					let amt_msat: Result<u64, _> = amt_str.unwrap().parse();
-					if amt_msat.is_err() {
-						println!("ERROR: getinvoice provided payment amount was not a number");
-						continue;
-					}
-
-					let expiry_secs_str = words.next();
-					if expiry_secs_str.is_none() {
-						println!("ERROR: getinvoice requires an expiry in seconds");
-						continue;
-					}
-
-					let expiry_secs: Result<u32, _> = expiry_secs_str.unwrap().parse();
-					if expiry_secs.is_err() {
-						println!("ERROR: getinvoice provided expiry was not a number");
-						continue;
-					}
-
-					get_invoice(
-						amt_msat.unwrap(),
-						inbound_payments.clone(),
-						channel_manager.clone(),
-						keys_manager.clone(),
-						network,
-						expiry_secs.unwrap(),
-					);
-				}
-				"connectpeer" => {
-					let peer_pubkey_and_ip_addr = words.next();
-					if peer_pubkey_and_ip_addr.is_none() {
-						println!("ERROR: connectpeer requires peer connection info: `connectpeer pubkey@host:port`");
-						continue;
-					}
-					let (pubkey, peer_addr) =
-						match parse_peer_info(peer_pubkey_and_ip_addr.unwrap().to_string()) {
-							Ok(info) => info,
-							Err(e) => {
-								println!("{:?}", e.into_inner().unwrap());
-								continue;
-							}
-						};
-					if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
-						.await
-						.is_ok()
-					{
-						println!("SUCCESS: connected to peer {}", pubkey);
-					}
-				}
-				"listchannels" => list_channels(&channel_manager, &network_graph),
-				"listpayments" => {
-					list_payments(inbound_payments.clone(), outbound_payments.clone())
-				}
-				"closechannel" => {
-					let channel_id_str = words.next();
-					if channel_id_str.is_none() {
-						println!("ERROR: closechannel requires a channel ID: `closechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
-					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
-						println!("ERROR: couldn't parse channel_id");
-						continue;
-					}
-					let mut channel_id = [0; 32];
-					channel_id.copy_from_slice(&channel_id_vec.unwrap());
-
-					let peer_pubkey_str = words.next();
-					if peer_pubkey_str.is_none() {
-						println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
-						Some(peer_pubkey_vec) => peer_pubkey_vec,
-						None => {
-							println!("ERROR: couldn't parse peer_pubkey");
-							continue;
-						}
-					};
-					let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
-						Ok(peer_pubkey) => peer_pubkey,
-						Err(_) => {
-							println!("ERROR: couldn't parse peer_pubkey");
-							continue;
-						}
-					};
-
-					close_channel(channel_id, peer_pubkey, channel_manager.clone());
-				}
-				"forceclosechannel" => {
-					let channel_id_str = words.next();
-					if channel_id_str.is_none() {
-						println!("ERROR: forceclosechannel requires a channel ID: `forceclosechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
-					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
-						println!("ERROR: couldn't parse channel_id");
-						continue;
-					}
-					let mut channel_id = [0; 32];
-					channel_id.copy_from_slice(&channel_id_vec.unwrap());
-
-					let peer_pubkey_str = words.next();
-					if peer_pubkey_str.is_none() {
-						println!("ERROR: forceclosechannel requires a peer pubkey: `forceclosechannel <channel_id> <peer_pubkey>`");
-						continue;
-					}
-					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
-						Some(peer_pubkey_vec) => peer_pubkey_vec,
-						None => {
-							println!("ERROR: couldn't parse peer_pubkey");
-							continue;
-						}
-					};
-					let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
-						Ok(peer_pubkey) => peer_pubkey,
-						Err(_) => {
-							println!("ERROR: couldn't parse peer_pubkey");
-							continue;
-						}
-					};
-
-					force_close_channel(channel_id, peer_pubkey, channel_manager.clone());
-				}
-				"nodeinfo" => node_info(&channel_manager, &peer_manager),
-				"listpeers" => list_peers(peer_manager.clone()),
-				"signmessage" => {
-					const MSG_STARTPOS: usize = "signmessage".len() + 1;
-					if line.as_bytes().len() <= MSG_STARTPOS {
-						println!("ERROR: signmsg requires a message");
-						continue;
-					}
-					println!(
-						"{:?}",
-						lightning::util::message_signing::sign(
-							&line.as_bytes()[MSG_STARTPOS..],
-							&keys_manager.get_node_secret(Recipient::Node).unwrap()
-						)
-					);
-				}
-				_ => println!("Unknown command. See `\"help\" for available commands."),
 			}
+			"sendpayment" => {
+				let invoice_str = words.next();
+				if invoice_str.is_none() {
+					println!("ERROR: sendpayment requires an invoice: `sendpayment <invoice>`");
+					return;
+				}
+
+				let invoice = match Invoice::from_str(invoice_str.unwrap()) {
+					Ok(inv) => inv,
+					Err(e) => {
+						println!("ERROR: invalid invoice: {:?}", e);
+						return;
+					}
+				};
+
+				send_payment(&*invoice_payer, &invoice, outbound_payments.clone());
+			}
+			"keysend" => {
+				let dest_pubkey = match words.next() {
+					Some(dest) => match hex_utils::to_compressed_pubkey(dest) {
+						Some(pk) => pk,
+						None => {
+							println!("ERROR: couldn't parse destination pubkey");
+							return;
+						}
+					},
+					None => {
+						println!("ERROR: keysend requires a destination pubkey: `keysend <dest_pubkey> <amt_msat>`");
+						return;
+					}
+				};
+				let amt_msat_str = match words.next() {
+					Some(amt) => amt,
+					None => {
+						println!("ERROR: keysend requires an amount in millisatoshis: `keysend <dest_pubkey> <amt_msat>`");
+						return;
+					}
+				};
+				let amt_msat: u64 = match amt_msat_str.parse() {
+					Ok(amt) => amt,
+					Err(e) => {
+						println!("ERROR: couldn't parse amount_msat: {}", e);
+						return;
+					}
+				};
+				keysend(
+					&*invoice_payer,
+					dest_pubkey,
+					amt_msat,
+					&*keys_manager,
+					outbound_payments.clone(),
+				);
+			}
+			"getinvoice" => {
+				let amt_str = words.next();
+				if amt_str.is_none() {
+					println!("ERROR: getinvoice requires an amount in millisatoshis");
+					return;
+				}
+
+				let amt_msat: Result<u64, _> = amt_str.unwrap().parse();
+				if amt_msat.is_err() {
+					println!("ERROR: getinvoice provided payment amount was not a number");
+					return;
+				}
+
+				let expiry_secs_str = words.next();
+				if expiry_secs_str.is_none() {
+					println!("ERROR: getinvoice requires an expiry in seconds");
+					return;
+				}
+
+				let expiry_secs: Result<u32, _> = expiry_secs_str.unwrap().parse();
+				if expiry_secs.is_err() {
+					println!("ERROR: getinvoice provided expiry was not a number");
+					return;
+				}
+
+				get_invoice(
+					amt_msat.unwrap(),
+					inbound_payments.clone(),
+					channel_manager.clone(),
+					keys_manager.clone(),
+					network,
+					expiry_secs.unwrap(),
+					logger.clone(),
+				);
+			}
+			"connectpeer" => {
+				let peer_pubkey_and_ip_addr = words.next();
+				if peer_pubkey_and_ip_addr.is_none() {
+					println!("ERROR: connectpeer requires peer connection info: `connectpeer pubkey@host:port`");
+					return;
+				}
+				let (pubkey, peer_addr) =
+					match parse_peer_info(peer_pubkey_and_ip_addr.unwrap().to_string()) {
+						Ok(info) => info,
+						Err(e) => {
+							println!("{:?}", e.into_inner().unwrap());
+							return;
+						}
+					};
+				if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone()).await.is_ok()
+				{
+					println!("SUCCESS: connected to peer {}", pubkey);
+				}
+			}
+			"listchannels" => list_channels(&channel_manager, &network_graph),
+			"listpayments" => list_payments(inbound_payments.clone(), outbound_payments.clone()),
+			"closechannel" => {
+				let channel_id_str = words.next();
+				if channel_id_str.is_none() {
+					println!("ERROR: closechannel requires a channel ID: `closechannel <channel_id> <peer_pubkey>`");
+					return;
+				}
+				let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
+				if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
+					println!("ERROR: couldn't parse channel_id");
+					return;
+				}
+				let mut channel_id = [0; 32];
+				channel_id.copy_from_slice(&channel_id_vec.unwrap());
+
+				let peer_pubkey_str = words.next();
+				if peer_pubkey_str.is_none() {
+					println!("ERROR: closechannel requires a peer pubkey: `closechannel <channel_id> <peer_pubkey>`");
+					return;
+				}
+				let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+					Some(peer_pubkey_vec) => peer_pubkey_vec,
+					None => {
+						println!("ERROR: couldn't parse peer_pubkey");
+						return;
+					}
+				};
+				let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+					Ok(peer_pubkey) => peer_pubkey,
+					Err(_) => {
+						println!("ERROR: couldn't parse peer_pubkey");
+						return;
+					}
+				};
+
+				close_channel(channel_id, peer_pubkey, channel_manager.clone());
+			}
+			"forceclosechannel" => {
+				let channel_id_str = words.next();
+				if channel_id_str.is_none() {
+					println!("ERROR: forceclosechannel requires a channel ID: `forceclosechannel <channel_id> <peer_pubkey>`");
+					return;
+				}
+				let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
+				if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
+					println!("ERROR: couldn't parse channel_id");
+					return;
+				}
+				let mut channel_id = [0; 32];
+				channel_id.copy_from_slice(&channel_id_vec.unwrap());
+
+				let peer_pubkey_str = words.next();
+				if peer_pubkey_str.is_none() {
+					println!("ERROR: forceclosechannel requires a peer pubkey: `forceclosechannel <channel_id> <peer_pubkey>`");
+					return;
+				}
+				let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+					Some(peer_pubkey_vec) => peer_pubkey_vec,
+					None => {
+						println!("ERROR: couldn't parse peer_pubkey");
+						return;
+					}
+				};
+				let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+					Ok(peer_pubkey) => peer_pubkey,
+					Err(_) => {
+						println!("ERROR: couldn't parse peer_pubkey");
+						return;
+					}
+				};
+
+				force_close_channel(channel_id, peer_pubkey, channel_manager.clone());
+			}
+			"nodeinfo" => node_info(&channel_manager, &peer_manager),
+			"listpeers" => list_peers(peer_manager.clone()),
+			"signmessage" => {
+				const MSG_STARTPOS: usize = "signmessage".len() + 1;
+				if line.as_bytes().len() <= MSG_STARTPOS {
+					println!("ERROR: signmsg requires a message");
+					return;
+				}
+				println!(
+					"{:?}",
+					lightning::util::message_signing::sign(
+						&line.as_bytes()[MSG_STARTPOS..],
+						&keys_manager.get_node_secret(Recipient::Node).unwrap()
+					)
+				);
+			}
+			_ => println!("Unknown command. See `\"help\" for available commands."),
 		}
 	}
+
+	peer_manager.process_events();
 }
 
 fn help() {
@@ -477,7 +358,7 @@ fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<Netw
 			.get(&NodeId::from_pubkey(&chan_info.counterparty.node_id))
 		{
 			if let Some(announcement) = &node_info.announcement_info {
-				println!("\t\tpeer_alias: {}", NodeAlias(&announcement.alias));
+				println!("\t\tpeer_alias: {}", announcement.alias);
 			}
 		}
 
@@ -493,6 +374,7 @@ fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<Netw
 		}
 		println!("\t\tchannel_can_send_payments: {},", chan_info.is_usable);
 		println!("\t\tpublic: {},", chan_info.is_public);
+		println!("Outbound capacity msat {}", chan_info.outbound_capacity_msat);
 		println!("\t}},");
 	}
 	println!("]");
@@ -585,12 +467,16 @@ fn open_channel(
 	channel_manager: Arc<ChannelManager>,
 ) -> Result<(), ()> {
 	let config = UserConfig {
-		peer_channel_config_limits: ChannelHandshakeLimits {
+		channel_handshake_limits: ChannelHandshakeLimits {
 			// lnd's max to_self_delay is 2016, so we want to be compatible.
 			their_to_self_delay: 2016,
 			..Default::default()
 		},
-		channel_options: ChannelConfig { announced_channel, ..Default::default() },
+		channel_handshake_config: ChannelHandshakeConfig {
+			announced_channel,
+			max_inbound_htlc_value_in_flight_percent_of_channel: 50,
+			..Default::default()
+		},
 		..Default::default()
 	};
 
@@ -696,7 +582,8 @@ fn keysend<E: EventHandler, K: KeysInterface>(
 
 fn get_invoice(
 	amt_msat: u64, payment_storage: PaymentInfoStorage, channel_manager: Arc<ChannelManager>,
-	keys_manager: Arc<KeysManager>, network: Network, expiry_secs: u32,
+	keys_manager: Arc<CustomKeysManager>, network: Network, expiry_secs: u32,
+	logger: Arc<disk::FilesystemLogger>,
 ) {
 	let mut payments = payment_storage.lock().unwrap();
 	let currency = match network {
@@ -708,6 +595,7 @@ fn get_invoice(
 	let invoice = match utils::create_invoice_from_channelmanager(
 		&channel_manager,
 		keys_manager,
+		logger,
 		currency,
 		Some(amt_msat),
 		"ldk-tutorial-node".to_string(),
@@ -747,7 +635,7 @@ fn close_channel(
 fn force_close_channel(
 	channel_id: [u8; 32], counterparty_node_id: PublicKey, channel_manager: Arc<ChannelManager>,
 ) {
-	match channel_manager.force_close_channel(&channel_id, &counterparty_node_id) {
+	match channel_manager.force_close_broadcasting_latest_txn(&channel_id, &counterparty_node_id) {
 		Ok(()) => println!("EVENT: initiating channel force-close"),
 		Err(e) => println!("ERROR: failed to force-close channel: {:?}", e),
 	}
