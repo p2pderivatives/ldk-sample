@@ -3,20 +3,27 @@ mod cli;
 mod configuration;
 mod convert;
 mod disk;
-mod dlc_cli;
+mod dlc_utils;
 mod hex_utils;
+mod utils;
 mod wallet_cli;
 
 use crate::disk::FilesystemLogger;
+use crate::dlc_utils::{get_contract_payout, get_subchannel_contract};
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::blockdata::transaction::Transaction;
 use bitcoin::secp256k1::Secp256k1;
 use bitcoin::{Address, BlockHash, PackedLockTime, Script, Sequence, TxIn, TxOut, Witness};
 use bitcoin_bech32::WitnessProgram;
+use dlc_manager::contract::contract_input::{ContractInput, ContractInputInfo, OracleInput};
 use dlc_manager::custom_signer::{CustomKeysManager, CustomSigner};
 use dlc_manager::manager::Manager;
-use dlc_manager::{Blockchain, Oracle, Signer, SystemTimeProvider, Utxo, Wallet};
+use dlc_manager::{
+	Blockchain, ChannelId, Oracle, Signer, Storage, SystemTimeProvider, Utxo, Wallet,
+};
 use dlc_messages::message_handler::MessageHandler as DlcMessageHandler;
+use dlc_messages::sub_channel::SubChannelMessage;
+use dlc_messages::Message;
 use dlc_sled_storage_provider::SledStorageProvider;
 use electrs_blockchain_provider::ElectrsBlockchainProvider;
 use lightning::chain::chaininterface::{BroadcasterInterface, ConfirmationTarget, FeeEstimator};
@@ -45,9 +52,8 @@ use lightning_persister::FilesystemPersister;
 use lightning_rapid_gossip_sync::RapidGossipSync;
 use p2pd_oracle_client::P2PDOracleClient;
 use rand::{thread_rng, Rng};
-use simple_wallet::WalletStorage;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 use std::fs;
@@ -58,6 +64,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
+
+pub(crate) const CONTRACT_DURATION: u64 = 600;
+const RENEWAL_LIMIT: u64 = 120;
 
 pub(crate) enum HTLCStatus {
 	Pending,
@@ -151,16 +160,7 @@ type SubChannelManager = dlc_manager::sub_channel_manager::SubChannelManager<
 	Arc<P2PDOracleClient>,
 	Arc<SystemTimeProvider>,
 	Arc<ElectrsBlockchainProvider>,
-	Arc<
-		Manager<
-			Arc<SimpleWallet>,
-			Arc<ElectrsBlockchainProvider>,
-			Arc<SledStorageProvider>,
-			Arc<P2PDOracleClient>,
-			Arc<SystemTimeProvider>,
-			Arc<ElectrsBlockchainProvider>,
-		>,
-	>,
+	Arc<DlcManager>,
 >;
 
 struct NodeAlias<'a>(&'a [u8; 32]);
@@ -716,6 +716,7 @@ async fn start_ldk() {
 			channel_manager_listener.process_pending_events(&event_handler_clone);
 			chain_monitor_listener.process_pending_events(&event_handler_clone);
 			peer_manager_clone.process_events();
+
 			std::thread::sleep(Duration::from_secs(1));
 		}
 	});
@@ -831,11 +832,6 @@ async fn start_ldk() {
 	let wallet_clone = wallet.clone();
 	let electrs_clone = electrs.clone();
 
-	let addresses = storage.get_addresses().unwrap();
-	for address in addresses {
-		println!("{}", address);
-	}
-
 	let store_clone = storage.clone();
 
 	let dlc_manager = tokio::task::spawn_blocking(move || {
@@ -854,17 +850,141 @@ async fn start_ldk() {
 	.await
 	.unwrap();
 
+	let electrs_clone = electrs.clone();
+	let blockchain_height =
+		tokio::task::spawn_blocking(move || electrs_clone.get_blockchain_height().unwrap())
+			.await
+			.unwrap();
+
 	let sub_channel_manager = Arc::new(SubChannelManager::new(
 		Secp256k1::new(),
 		wallet.clone(),
 		channel_manager.clone(),
-		storage,
+		storage.clone(),
 		electrs.clone(),
 		dlc_manager.clone(),
+		electrs.clone(),
+		blockchain_height,
 	));
 
+	let dlc_message_handler_clone = dlc_message_handler.clone();
+
+	let dlc_manager_clone = dlc_manager.clone();
+	let sub_channel_manager_clone = sub_channel_manager.clone();
+	let peer_manager_clone = peer_manager.clone();
+	let updating_channels = Arc::new(Mutex::new(HashSet::<ChannelId>::new()));
+	let updating_channels_clone = updating_channels.clone();
+
+	std::thread::spawn(move || loop {
+		process_incoming_messages(
+			&peer_manager_clone,
+			&dlc_manager_clone,
+			&sub_channel_manager_clone,
+			&dlc_message_handler_clone,
+			&updating_channels_clone,
+		);
+		match dlc_manager_clone.periodic_check() {
+			Err(e) => println!("Dlc manager periodic check error {}", e),
+			_ => {}
+		};
+		match sub_channel_manager_clone.check_for_watched_tx() {
+			Err(e) => println!("Sub channel manager check error {}", e),
+			_ => {}
+		};
+		std::thread::sleep(std::time::Duration::from_secs(2));
+	});
+
+	let storage_clone = storage.clone();
+	let dlc_manager_clone = dlc_manager.clone();
+	let electrs_clone = electrs.clone();
+	let dlc_message_handler_clone = dlc_message_handler.clone();
+	let updating_channels_clone = updating_channels.clone();
+
+	std::thread::spawn(move || loop {
+		for sub_channel in storage_clone.get_sub_channels().unwrap() {
+			if !sub_channel.is_offer {
+				continue;
+			}
+
+			let mut locked_updating_channels = updating_channels.lock().unwrap();
+			if locked_updating_channels.contains(&sub_channel.channel_id) {
+				continue;
+			}
+
+			let contract = get_subchannel_contract(&sub_channel, &storage_clone);
+
+			if let Some(contract) = contract {
+				let maturity = contract.accepted_contract.offered_contract.contract_maturity_bound;
+				let now = std::time::SystemTime::now()
+					.duration_since(std::time::SystemTime::UNIX_EPOCH)
+					.unwrap();
+				let d_maturity = std::time::Duration::from_secs(maturity as u64);
+
+				if now.checked_add(std::time::Duration::from_secs(RENEWAL_LIMIT)).unwrap()
+					> d_maturity
+				{
+					locked_updating_channels.insert(sub_channel.channel_id);
+					let last_price: dlc_utils::LastPrice = match reqwest::blocking::get(
+						"https://api.bitflyer.com/v1/ticker?product_code=BTC_USD",
+					) {
+						Err(e) => {
+							println!("Error getting current btc/usd rate {}", e);
+							continue;
+						}
+						Ok(v) => v.json().expect("error deserializing btc/usd rate"),
+					};
+					let payout = get_contract_payout(&contract, &last_price);
+					let current_rate = last_price.ltp.round() as u64;
+					let new_contract = crate::dlc_utils::build_cfd_contract(
+						1048575,
+						payout.offer,
+						contract.accepted_contract.offered_contract.total_collateral,
+						current_rate,
+					)
+					.unwrap();
+
+					let expiry_date = now
+						.checked_add(std::time::Duration::from_secs(CONTRACT_DURATION))
+						.unwrap()
+						.as_secs();
+
+					let event_id = format!("btcusd{}", expiry_date);
+
+					let contract_input_info = ContractInputInfo {
+						contract_descriptor: new_contract,
+						oracles: OracleInput {
+							public_keys: vec![oracle_pubkey],
+							event_id,
+							threshold: 1,
+						},
+					};
+
+					let fee_rate_per_1000_weight = electrs_clone
+						.get_est_sat_per_1000_weight(ConfirmationTarget::Normal)
+						as f64;
+					let fee_rate_per_vb = (fee_rate_per_1000_weight / 4000.0).round() as u64;
+
+					let contract_input = ContractInput {
+						offer_collateral: payout.offer,
+						accept_collateral: payout.accept,
+						maturity_time: expiry_date as u32,
+						fee_rate: fee_rate_per_vb,
+						contract_infos: vec![contract_input_info],
+					};
+
+					let (renew_offer, _) = dlc_manager_clone
+						.renew_offer(&sub_channel.channel_id, payout.accept, &contract_input)
+						.unwrap();
+					dlc_message_handler_clone
+						.send_message(sub_channel.counter_party, Message::RenewOffer(renew_offer));
+				}
+			}
+		}
+		std::thread::sleep(std::time::Duration::from_secs(30));
+	});
+
 	loop {
-		println!("Enter 1 for LN functions, 2 for DLC, 3 for wallet");
+		println!("Enter 1 for LN functions, 2 for wallet");
 		print!(">");
 		io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
 
@@ -892,21 +1012,16 @@ async fn start_ldk() {
 						ldk_data_dir.clone(),
 						network,
 						logger.clone(),
+						p2pdoracle.clone(),
+						sub_channel_manager.clone(),
+						dlc_message_handler.clone(),
+						electrs.clone(),
+						storage.clone(),
+						updating_channels_clone.clone(),
 					)
 					.await
 				}
 				2 => {
-					dlc_cli::poll_for_user_input(
-						peer_manager.clone(),
-						dlc_message_handler.clone(),
-						dlc_manager.clone(),
-						sub_channel_manager.clone(),
-						p2pdoracle.clone(),
-						&offers_path,
-					)
-					.await
-				}
-				3 => {
 					wallet_cli::poll_for_user_input(&wallet).await;
 				}
 				_ => {
@@ -923,6 +1038,100 @@ async fn start_ldk() {
 
 	// Stop the background processor.
 	background_processor.stop().unwrap();
+}
+
+fn process_incoming_messages(
+	peer_manager: &Arc<PeerManager>, dlc_manager: &Arc<DlcManager>,
+	sub_channel_manager: &Arc<SubChannelManager>, dlc_message_handler: &Arc<DlcMessageHandler>,
+	updating_channels: &Arc<Mutex<HashSet<ChannelId>>>,
+) {
+	let messages = dlc_message_handler.get_and_clear_received_messages();
+
+	for (node_id, message) in messages {
+		let resp = dlc_manager.on_dlc_message(&message, node_id).expect("Error processing message");
+		if let Some(msg) = resp {
+			dlc_message_handler.send_message(node_id, msg);
+		} else if let Message::RenewOffer(r) = message {
+			let renew_accept = match dlc_manager.accept_renew_offer(&r.channel_id) {
+				Ok((msg, _)) => msg,
+				Err(e) => {
+					println!("Error accepting channel {}", e);
+					return;
+				}
+			};
+			dlc_message_handler.send_message(node_id, Message::RenewAccept(renew_accept));
+		} else if let Message::RenewConfirm(r) = message {
+			updating_channels.lock().unwrap().remove(&r.channel_id);
+			println!("CFD contract renewed.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		} else if let Message::RenewFinalize(r) = message {
+			updating_channels.lock().unwrap().remove(&r.channel_id);
+			println!("CFD contract renewed.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		}
+	}
+
+	let sub_channel_messages = dlc_message_handler.get_and_clear_received_sub_channel_messages();
+
+	for (node_id, message) in sub_channel_messages {
+		let resp = sub_channel_manager
+			.on_sub_channel_message(&message, &node_id)
+			.expect("Error processing message");
+		if let Some(msg) = resp {
+			dlc_message_handler.send_subchannel_message(node_id, msg);
+		} else if let SubChannelMessage::Request(r) = message {
+			let msg = match sub_channel_manager.accept_sub_channel(&r.channel_id) {
+				Ok((_, msg)) => {
+					updating_channels.lock().unwrap().insert(msg.channel_id);
+					println!("Setting up CFD contract.");
+					print!(">");
+					io::stdout().flush().unwrap();
+					msg
+				}
+				Err(e) => {
+					println!("Error accepting sub channel {}", e);
+					return;
+				}
+			};
+			dlc_message_handler.send_subchannel_message(node_id, SubChannelMessage::Accept(msg));
+		} else if let SubChannelMessage::CloseOffer(c) = message {
+			let msg = match sub_channel_manager.accept_subchannel_close_offer(&c.channel_id) {
+				Ok((msg, _)) => msg,
+				Err(e) => {
+					println!("Error accepting close offer {}", e);
+					return;
+				}
+			};
+			dlc_message_handler
+				.send_subchannel_message(node_id, SubChannelMessage::CloseAccept(msg));
+		} else if let SubChannelMessage::Confirm(c) = &message {
+			updating_channels.lock().unwrap().remove(&c.channel_id);
+			println!("CFD contract setup done.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		} else if let SubChannelMessage::Finalize(f) = &message {
+			updating_channels.lock().unwrap().remove(&f.channel_id);
+			println!("CFD contract setup done.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		} else if let SubChannelMessage::CloseConfirm(f) = &message {
+			updating_channels.lock().unwrap().remove(&f.channel_id);
+			println!("Channel unstabilized.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		} else if let SubChannelMessage::CloseFinalize(f) = &message {
+			updating_channels.lock().unwrap().remove(&f.channel_id);
+			println!("Channel unstabilized.");
+			print!("> ");
+			io::stdout().flush().unwrap();
+		}
+	}
+
+	if dlc_message_handler.has_pending_messages() {
+		peer_manager.process_events();
+	}
 }
 
 #[tokio::main]

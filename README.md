@@ -1,5 +1,17 @@
 # ldk-sample
-Sample node implementation using LDK and rust-dlc, supporting DLC within Lightning channels.
+Sample node implementation using LDK and rust-dlc, enabling "stabilizing" part of the fund of a lightning channel, pegging its value to USD.
+
+## Functionalities
+
+Two new commands are available under the LN sub-menu:
+* stabilizechannel that takes a channel ID and the collateral to be stabilized for each party
+* unstabilizechannel that will return the channel to a "regular" LN one.
+
+Once a channel is stabilized, the underlying CFD contract will be automatically renewed 2 minutes before the contract expiry.
+Contract maturity is set to 10 minutes after contract creation (in practice this could/should be days or weeks).
+
+The fund that are not "stabilized" can still be used for Lightning routing.
+There is no "re-balance" functionality implemented at the moment, but it can be done manually by "unstabilizing" and "re-stabilizing" with different collaterals for each party.
 
 ## Quick run on regtest
 
@@ -22,11 +34,11 @@ cargo run ./examples/configurations/bob.yml
 Back to the first terminal where the CLI is running:
 
 ```
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
->3
+Enter 1 for LN functions, 2 for wallet
+>2
 > getnewaddress
 Receiving address: xxxxxxxx
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
+Enter 1 for LN functions, 2 for wallet
 >
 ```
 
@@ -38,18 +50,16 @@ bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzW
 
 Back to the first terminal:
 ```
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
->3
+Enter 1 for LN functions, 2 for wallet
+>2
 > getbalance
 Balance: 200000
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
+Enter 1 for LN functions, 2 for wallet
 >1
-LDK startup successful. To view available commands: "help".
-LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs
-Local Node ID is 025ba196b3257938b02032f806d1ef6edd8403b5a3a5df8b5549429090e615a9ac.
+To view available commands: "help".
 > openchannel 02f7486899f42946a19d5f5bbdfb537d91e200dfda85408b014600a18255e53014@127.0.0.1:9001 180000
 EVENT: initiated channel with peer 02f7486899f42946a19d5f5bbdfb537d91e200dfda85408b014600a18255e53014.
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
+Enter 1 for LN functions, 2 for wallet
 >
 ```
 (replace the node id with that of the second instance)
@@ -61,11 +71,9 @@ bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzW
 
 In the first terminal check that the channel is confirmed and do a keysend to the second node:
 ```
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
+Enter 1 for LN functions, 2 for wallet
 > 1
-LDK startup successful. To view available commands: "help".
-LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs
-Local Node ID is 025ba196b3257938b02032f806d1ef6edd8403b5a3a5df8b5549429090e615a9ac.
+To view available commands: "help".
 > listchannels
 [
         {
@@ -83,62 +91,28 @@ Local Node ID is 025ba196b3257938b02032f806d1ef6edd8403b5a3a5df8b5549429090e615a
 Outbound capacity msat 178200000
         },
 ]
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
+Enter 1 for LN functions, 2 for wallet
 > 1
 > keysend 02f7486899f42946a19d5f5bbdfb537d91e200dfda85408b014600a18255e53014 90000000
 EVENT: initiated sending 90000000 msats to 02f7486899f42946a19d5f5bbdfb537d91e200dfda85408b014600a18255e53014
-> Enter 1 for LN functions, 2 for DLC, 3 for wallet
+> Enter 1 for LN functions, 2 for wallet
 >
 EVENT: successfully sent payment of 90000000 millisatoshis (fee 0 msat) from payment hash "a5fd1b7544dc5794cb10869e5a7f676c68d37b472d27bfe028986275b05e67c5" with preimage "f9a7957e4946d082f5822586129d221691b34be5e2091d0e4e8c0993180621b9"
 ```
 
-In the same terminal we can now offer to open a "subchannel" with a DLC in it:
+In the same terminal we can now "stabilize" part of the channel funds:
 ```
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
->2
+Enter 1 for LN functions, 2 for wallet
+> 1
 To view available commands: "help".
-> offersubchannel 02f7486899f42946a19d5f5bbdfb537d91e200dfda85408b014600a18255e53014 ./examples/contracts/numerical_contract_input.json bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca
-Checking for messages
+> stabilizechannel bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca 45000 45000
+Enter 1 for LN functions, 2 for wallet
+>CFD contract setup done.
+> 
 ```
 
-Remember to use the proper node id and channel id.
-
-In the second instance we accept the offer:
-```
-Enter 1 for LN functions, 2 for DLC, 3 for wallet
->2
-To view available commands: "help".
-> listsubchanneloffers
-Checking for messages
-Sub channel offer bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca with 025ba196b3257938b02032f806d1ef6edd8403b5a3a5df8b5549429090e615a9ac
-> acceptsubchannel bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca
-Checking for messages
->
-```
-
-To process messages to be exchanged, just enter anything (like "2") while under the DLC sub-menu on both sides.
-Once the sub-channel is set up, we can force close it as follows:
-
-```
-initiateforceclosesubchannel bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca
-```
-
-Then generate at least 288 blocks in another terminal:
-```
-$bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzWU4nV8uVoo=" -regtest generatetoaddress 289 $(bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzWU4nV8uVoo=" -regtest getnewaddress)
-```
-
-Finalize the force closing:
-```
-finalizeforceclosesubchannel bc7121c4d2c809777930be4d82a944139fc815d010184ef20e4bfe72c20a17ca
-```
-
-Finalize the closing by generating more blocks:
-```
-$bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzWU4nV8uVoo=" -regtest generatetoaddress 289 $(bitcoin-cli -rpcuser="testuser" -rpcpassword="lq6zequb-gYTdF2_ZEUtr8ywTXzLYtknzWU4nV8uVoo=" -regtest getnewaddress)
-```
-
-Then navigating to the DLC sub-menu should trigger the sending of the CET to close the DLC channel.
+It will take some time before the "CFD contract setup done." part appears, this is because the setup of the DLC requires signing and verifying a large number of adaptor signatures (using the parallel feature of rust-dlc can make it a bit faster).
+Remember to use the proper channel id.
 
 ## License
 

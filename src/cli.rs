@@ -1,5 +1,7 @@
-use crate::disk;
+use crate::dlc_utils::{get_contract_payout, get_subchannel_contract, LastPrice};
 use crate::hex_utils;
+use crate::utils::{read_id, try_read_word};
+use crate::{disk, SubChannelManager};
 use crate::{
 	ChannelManager, HTLCStatus, InvoicePayer, MillisatAmount, NetworkGraph, PaymentInfo,
 	PaymentInfoStorage, PeerManager,
@@ -8,8 +10,17 @@ use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::network::constants::Network;
 use bitcoin::secp256k1::PublicKey;
+use dlc_manager::contract::contract_input::{ContractInput, ContractInputInfo, OracleInput};
 use dlc_manager::custom_signer::CustomKeysManager;
+use dlc_manager::sub_channel_manager::SubChannelState;
+use dlc_manager::{ChannelId, Oracle, Storage};
+use dlc_messages::message_handler::MessageHandler;
+use dlc_messages::sub_channel::SubChannelMessage;
+use dlc_sled_storage_provider::SledStorageProvider;
+use electrs_blockchain_provider::ElectrsBlockchainProvider;
+use lightning::chain::chaininterface::{ConfirmationTarget, FeeEstimator};
 use lightning::chain::keysinterface::{KeysInterface, Recipient};
+use lightning::ln::channelmanager::ChannelDetails;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::ChannelHandshakeConfig;
@@ -17,21 +28,57 @@ use lightning::util::config::{ChannelHandshakeLimits, UserConfig};
 use lightning::util::events::EventHandler;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
+use p2pd_oracle_client::P2PDOracleClient;
+use std::collections::HashSet;
 use std::io;
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+macro_rules! read_id_or_return {
+	($words: ident, $err_cmd: expr, $err_arg: expr) => {
+		match read_id(&mut $words, $err_cmd, $err_arg) {
+			Ok(res) => res,
+			Err(()) => return,
+		}
+	};
+}
+
+macro_rules! try_read_or_return {
+	($words: ident, $err_cmd: expr, $err_arg: expr) => {
+		match try_read_word(&mut $words, $err_cmd, $err_arg) {
+			Ok(res) => res,
+			Err(()) => return,
+		}
+	};
+}
+
+macro_rules! try_parse_or_return {
+	($words: ident, $err_cmd: expr, $err_arg: expr) => {{
+		let r = try_read_or_return!($words, $err_cmd, $err_arg);
+		match r.parse() {
+			Ok(res) => res,
+			Err(e) => {
+				println!("Error parsing {} {}", $err_arg, e);
+				return;
+			}
+		}
+	}};
+}
 
 pub(crate) async fn poll_for_user_input<E: EventHandler>(
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<CustomKeysManager>,
 	network_graph: Arc<NetworkGraph>, inbound_payments: PaymentInfoStorage,
 	outbound_payments: PaymentInfoStorage, ldk_data_dir: String, network: Network,
-	logger: Arc<disk::FilesystemLogger>,
+	logger: Arc<disk::FilesystemLogger>, oracle: Arc<P2PDOracleClient>,
+	sub_channel_manager: Arc<SubChannelManager>, dlc_message_handler: Arc<MessageHandler>,
+	electrs: Arc<ElectrsBlockchainProvider>, storage: Arc<SledStorageProvider>,
+	updating_channels: Arc<Mutex<HashSet<ChannelId>>>,
 ) {
 	println!("To view available commands: \"help\".");
 	let stdin = io::stdin();
@@ -296,11 +343,121 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 					)
 				);
 			}
+			s @ "stabilizechannel" => {
+				let mut locked_updating_channel = updating_channels.lock().unwrap();
+				let channel_id = read_id_or_return!(words, s, "channel id");
+				if locked_updating_channel.contains(&channel_id) {
+					println!("Channel is updating please wait and try again.");
+					return;
+				}
+				let to_stabilize_amount: u64 =
+					try_parse_or_return!(words, s, "to_stabilize_amount");
+				let counter_collateral: u64 = try_parse_or_return!(words, s, "counter_collateral");
+
+				let expiry_date: u64 = std::time::SystemTime::now()
+					.duration_since(std::time::SystemTime::UNIX_EPOCH)
+					.expect("to be able to get unix time")
+					.checked_add(std::time::Duration::from_secs(crate::CONTRACT_DURATION as u64))
+					.expect("to be able to add 10 minutes")
+					.as_secs();
+
+				let channel_list = channel_manager.list_channels();
+				let channel_details = match channel_list.iter().find(|x| x.channel_id == channel_id)
+				{
+					None => {
+						println!("Could not find specified channel");
+						return;
+					}
+					Some(info) => info,
+				};
+				let fee_rate_per_1000_weight =
+					electrs.get_est_sat_per_1000_weight(ConfirmationTarget::Normal) as f64;
+				let fee_rate_per_vb = (fee_rate_per_1000_weight / 4000.0).round() as u64;
+				match stabilizechannel(
+					to_stabilize_amount,
+					counter_collateral,
+					expiry_date,
+					&channel_id,
+					channel_details,
+					&oracle,
+					&sub_channel_manager,
+					&dlc_message_handler,
+					fee_rate_per_vb,
+				)
+				.await
+				{
+					Ok(_) => {
+						locked_updating_channel.insert(channel_id);
+					}
+					Err(_) => {}
+				};
+			}
+			s @ "unstabilizechannel" => {
+				let mut locked_updating_channel = updating_channels.lock().unwrap();
+				let channel_id = read_id_or_return!(words, s, "channel id");
+				if locked_updating_channel.contains(&channel_id) {
+					println!("Channel is updating please wait and try again.");
+					return;
+				}
+				let sub_channel = match storage.get_sub_channel(channel_id).unwrap() {
+					Some(s) => {
+						match s.state {
+							SubChannelState::Signed(_) => {}
+							_ => {
+								println!("Not in a state to unstabilize.");
+								return;
+							}
+						}
+						s
+					}
+					None => {
+						println!("No sub channel for given channel id.");
+						return;
+					}
+				};
+				let last_price: LastPrice =
+					match reqwest::get("https://api.bitflyer.com/v1/ticker?product_code=BTC_USD")
+						.await
+					{
+						Err(e) => {
+							println!("Error getting current btc/usd rate {}", e);
+							return;
+						}
+						Ok(v) => v.json().await.expect("error deserializing btc/usd rate"),
+					};
+				let contract = match get_subchannel_contract(&sub_channel, &storage) {
+					Some(c) => c,
+					None => {
+						println!("Unexpectedly, could not get contract for sub channel");
+						return;
+					}
+				};
+
+				let payout = get_contract_payout(&contract, &last_price);
+				let counter_balance = if contract.accepted_contract.offered_contract.is_offer_party
+				{
+					payout.accept
+				} else {
+					payout.offer
+				};
+
+				let (msg, node_id) = match sub_channel_manager
+					.offer_subchannel_close(&channel_id, counter_balance)
+				{
+					Err(e) => {
+						println!("Could not offer subchannel close: {}", e);
+						return;
+					}
+					Ok(r) => r,
+				};
+
+				locked_updating_channel.insert(channel_id);
+				dlc_message_handler
+					.send_subchannel_message(node_id, SubChannelMessage::CloseOffer(msg));
+			}
 			_ => println!("Unknown command. See `\"help\" for available commands."),
 		}
 	}
-
-	peer_manager.process_events();
 }
 
 fn help() {
@@ -378,6 +535,80 @@ fn list_channels(channel_manager: &Arc<ChannelManager>, network_graph: &Arc<Netw
 		println!("\t}},");
 	}
 	println!("]");
+}
+
+async fn stabilizechannel(
+	amount_to_stabilize: u64, counter_collateral: u64, expiry_date: u64, channel_id: &[u8; 32],
+	channel_details: &ChannelDetails, oracle: &P2PDOracleClient,
+	sub_channel_manager: &Arc<SubChannelManager>, dlc_message_handler: &Arc<MessageHandler>,
+	fee_rate_per_vb: u64,
+) -> Result<(), ()> {
+	if channel_details.outbound_capacity_msat < amount_to_stabilize * 1000 {
+		println!("Amount to stabilize must be smaller than outbound capacity.");
+		return Err(());
+	}
+
+	if channel_details.inbound_capacity_msat < counter_collateral * 1000 {
+		println!("Counter collateral must be smaller than inbound capacity");
+		return Err(());
+	}
+
+	let current_rate: LastPrice =
+		match reqwest::get("https://api.bitflyer.com/v1/ticker?product_code=BTC_USD").await {
+			Err(e) => {
+				println!("Error getting current btc/usd rate {}", e);
+				return Err(());
+			}
+			Ok(v) => v.json().await.expect("error deserializing btc/usd rate"),
+		};
+
+	let event_id = format!("btcusd{}", expiry_date);
+
+	let contract_descriptor = match crate::dlc_utils::build_cfd_contract(
+		1048575,
+		amount_to_stabilize,
+		amount_to_stabilize + counter_collateral,
+		current_rate.ltp.round() as u64,
+	) {
+		Err(e) => {
+			println!("Could not create contract descriptor {}", e);
+			return Err(());
+		}
+		Ok(d) => d,
+	};
+
+	let contract_input_info = ContractInputInfo {
+		contract_descriptor,
+		oracles: OracleInput { public_keys: vec![oracle.get_public_key()], event_id, threshold: 1 },
+	};
+
+	let contract_input = ContractInput {
+		offer_collateral: amount_to_stabilize,
+		accept_collateral: counter_collateral,
+		maturity_time: expiry_date as u32,
+		fee_rate: fee_rate_per_vb,
+		contract_infos: vec![contract_input_info],
+	};
+
+	let manager_clone = sub_channel_manager.clone();
+	let oracle_clone = oracle.clone();
+	let channel_id = channel_id.clone();
+
+	let sub_channel_offer = tokio::task::spawn_blocking(move || {
+		let announcement = oracle_clone
+			.get_announcement(&contract_input.contract_infos[0].oracles.event_id)
+			.expect("to get an announcement");
+		manager_clone
+			.offer_sub_channel(&channel_id, &contract_input, &[vec![announcement]])
+			.unwrap()
+	})
+	.await
+	.unwrap();
+	dlc_message_handler.send_subchannel_message(
+		channel_details.counterparty.node_id,
+		SubChannelMessage::Request(sub_channel_offer),
+	);
+	Ok(())
 }
 
 fn list_payments(inbound_payments: PaymentInfoStorage, outbound_payments: PaymentInfoStorage) {
