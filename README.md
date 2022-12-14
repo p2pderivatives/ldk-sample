@@ -13,6 +13,17 @@ Contract maturity is set to 10 minutes after contract creation (in practice this
 The fund that are not "stabilized" can still be used for Lightning routing.
 There is no "re-balance" functionality implemented at the moment, but it can be done manually by "unstabilizing" and "re-stabilizing" with different collaterals for each party.
 
+## How it works
+
+When "stabilizing" part of the funds, the commitment transaction of the LN channel is replaced by a _split transaction_ with two outputs, one to keep funds within Lightning, and the other to fund a DLC channel.
+That way both the LN channel and DLC channel can be updated independently.
+
+The amount in the DLC channel is pegged to USD by setting up a CFD contract, represented by an hyperbola curve, with a collar at the outcome at which the maker's collateral becomes zero.
+
+At the moment a single oracle is used, but the [underlying library](https://github.com/p2pderivatives/rust-dlc) can support multiple and thresholds of oracles (e.g. 2 of 3), though at the cost of a longer setup time.
+
+More details about the construction can be found in [this article](https://medium.com/p/cb5d191f6e64).
+
 ## Quick run on regtest
 
 Requires docker and docker-compose.
